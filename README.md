@@ -84,13 +84,77 @@ NTAG21x 的状态机包括 `IDLE`、`READY1`、`READY2`、`ACTIVE`、`AUTHENTICA
 | `COMPATIBILITY_WRITE` | `A0h` | 页号 + 后续数据 | 兼容旧式写入时使用，按数据手册处理两阶段时序 |
 | `FAST_READ` | `3Ah` | 起始页 + 结束页 | 连续读取页范围，帧长度随页数变化 |
 | `GET_VERSION` | `60h` | 无 | 返回 8 字节产品版本信息 |
-| `READ_CNT` | `39h` | 计数器编号 | 读取 NFC counter |
+| `READ_CNT` | `39h` | 固定计数器地址 `02h` | 读取 24 位 NFC 单向计数器 |
 | `PWD_AUTH` | `1Bh` | 4 字节 PWD | 返回 2 字节 PACK；失败时按配置限制重试 |
 | `READ_SIG` | `3Ch` | 无 | 读取 ECC 原创性签名 |
 
 常见 ACK 为 4 位 `Ah`；NAK `0h`、`1h`、`4h`、`5h` 表示不同错误类别。实际驱动必须按 bit frame、CRC_A 和超时规则处理，而不是把返回值当作普通 8 位字节。
 
 `READ` 的返回长度固定为 16 字节，但请求参数是页地址；不能把返回长度误认为地址单位。`FAST_READ` 不应越过有效地址，越界和受保护访问都要检查 NAK。
+
+## 8.6 NFC 计数器
+
+NTAG21x 的 NFC counter 是一个 24 位单向计数器。它可以被读取，也可以由芯片自动递增，但不能通过命令直接写入、减小或清零。达到 `FFFFFFh` 后，计数值不再变化。
+
+### 先区分四个概念
+
+| 配置或机制 | 控制的行为 | 不控制的行为 |
+| --- | --- | --- |
+| `NFC_CNT_EN` | 是否在每次射频上电后的第一次有效 `READ` 或 `FAST_READ` 时自动加一 | 不决定 `READ_CNT` 是否需要密码 |
+| `NFC_CNT_PWD_PROT` | `READ_CNT` 和 NFC counter mirror 是否需要先完成 `PWD_AUTH` | 不负责启用计数器，也不决定何时加一 |
+| `READ_CNT` | 返回当前 24 位计数值 | 不会触发计数器加一 |
+| NFC counter mirror | 通过普通 `READ` 或 `FAST_READ` 返回 6 个 ASCII 十六进制字符 | 不是独立计数器，也不会额外加一 |
+
+### 专用命令和递增条件
+
+NTAG21x 只有一个计数器专用命令：`READ_CNT (39h)`。其参数不是可变编号，NTAG213、NTAG215 和 NTAG216 都使用固定 NFC counter 地址 `02h`：
+
+```text
+Request:  39 02 CRC_A
+Response: Counter[3 bytes] CRC_A
+```
+
+`READ_CNT` 只读取当前值。计数器递增由另一个事件触发：
+
+```text
+NFC_CNT_EN = 1
+        +
+RF field power-on reset
+        +
+first valid READ or FAST_READ
+        =
+counter increments once
+```
+
+同一次射频上电期间继续执行 `READ` 或 `FAST_READ` 不会重复增加。`REQA`、选卡、`GET_VERSION` 和 `READ_CNT` 也不会替代这个触发条件。协议没有单独的 increment、write 或 reset counter 命令。
+
+### 禁用计数器时的 `READ_CNT`
+
+`NFC_CNT_EN = 0` 关闭的是自动递增，不是 `READ_CNT` 命令。数据手册没有单列 `NFC_CNT_EN = 0` 时的特殊响应；它分别定义 `NFC_CNT_EN` 负责递增、`READ_CNT` 返回当前值，并且只把“启用密码保护但尚未认证”列为该命令的保护性 NAK 条件。因此工程实现应按以下行为处理：
+
+- 新标签的计数器通常保持在 `000000h`。
+- 如果计数器已经增长，清除 `NFC_CNT_EN` 只会冻结现有值，不会清零。
+- 未启用计数器密码保护时，`READ_CNT` 仍返回当前 3 字节值和 CRC_A。
+- 启用 `NFC_CNT_PWD_PROT` 后，未认证时 `READ_CNT` 返回 NAK，认证成功后返回当前值。
+
+| `NFC_CNT_EN` | `NFC_CNT_PWD_PROT` | 是否自动递增 | `READ_CNT` | Counter mirror |
+| ---: | ---: | --- | --- | --- |
+| `0` | `0` | 否 | 无需认证，返回冻结的当前值 | 不应依赖；数据手册要求 counter mirror 同时启用 `NFC_CNT_EN` |
+| `0` | `1` | 否 | 认证前 NAK，认证后返回冻结的当前值 | 不应依赖；数据手册要求 counter mirror 同时启用 `NFC_CNT_EN` |
+| `1` | `0` | 每次射频上电后首次有效 `READ` / `FAST_READ` 加一 | 无需认证，返回当前值 | 可配置为无需 counter 密码认证 |
+| `1` | `1` | 每次射频上电后首次有效 `READ` / `FAST_READ` 加一 | 认证前 NAK，认证后返回当前值 | 仅在有效密码认证后镜像 counter |
+
+### 除 `READ_CNT` 之外的读取方式
+
+启用 NFC counter mirror 后，芯片会把 3 字节计数值转换成 6 个 ASCII 十六进制字符，并虚拟映射到用户区。配置要求包括：
+
+- `NFC_CNT_EN = 1`。
+- `MIRROR_CONF = 10b` 时只镜像 counter，`11b` 时镜像 UID 和 counter。
+- `MIRROR_PAGE > 03h`，并确保 `MIRROR_PAGE`、`MIRROR_BYTE` 和所需长度不越过用户区边界。
+
+例如计数值 `003F31h` 会被普通 `READ` 或 `FAST_READ` 读取为 ASCII 字符 `003F31`，对应字节 `30 30 33 46 33 31`。该内容是读取时生成的虚拟数据，不是 MCU 反复写入 EEPROM 的结果。
+
+`NFC_CNT_PWD_PROT = 1` 同时保护 `READ_CNT` 和 counter mirror。设置为 `0` 时，`READ_CNT` 不需要密码；但 counter mirror 所在的用户页仍可能受到 `AUTH0 + PROT` 的页访问保护，这是独立的第二层访问条件。
 
 ## 安全和配置
 
@@ -194,14 +258,29 @@ AUTH0 <= page <= last_page
 
 ### `PWD`、`PACK` 和 `PWD_AUTH`
 
+配置表中的 `PWD 32 FFFFFFFFh` 和 `PACK 16 0000h` 分别表示字段名称、位宽和默认值：
+
+| 字段 | 位宽 | 出厂默认值 | 作用 |
+| --- | ---: | --- | --- |
+| `PWD` | 32 bit，4 字节 | `FFFFFFFFh` | 实际参与比较的秘密密码 |
+| `PACK` | 16 bit，2 字节 | `0000h` | 密码正确后返回的确认值 |
+
+因此 `PACK` 不是“16 位密码”，也不是根据 `PWD` 计算出的哈希或 MAC。`16` 只是字段宽度，`0000h` 是出厂默认值。量产时应同时配置非默认的 `PWD` 和 `PACK`，读写器还必须比较返回的 `PACK` 是否等于该标签的预期值。
+
 密码验证使用 `PWD_AUTH (1Bh)` 命令：
+
+```text
+Request:  1B PWD[4 bytes] CRC_A
+Success:  PACK[2 bytes] CRC_A
+Failure:  NAK or timeout
+```
 
 1. NFC 设备发送命令码 `1Bh` 和 4 字节 `PWD`。
 2. 密码正确时，标签返回 2 字节 `PACK`，并进入 `AUTHENTICATED` 状态。
 3. 在该状态下，可以访问由 `AUTH0` 和 `PROT` 保护、且尚未被锁定位锁死的页面。
 4. 执行 `HLTA`、掉场或复位后，认证状态失效，下次会话需要重新认证。
 
-`PACK` 是认证结果确认值。读写器应比较返回的 `PACK` 是否等于预期值，而不是仅凭收到响应就认为认证成功。`PWD` 和 `PACK` 的真实内容永远不能通过 `READ` 或 `FAST_READ` 读出，读取对应页面时标签返回 `00h` 字节。仅写入 `PWD` 和 `PACK` 不会自动启用保护，必须继续配置 `AUTH0`。
+`PWD` 和 `PACK` 在配置页以及 `PWD_AUTH` 命令和响应中均按低字节优先排列。例如数值 `PACK = 1234h` 的字节顺序为 `34 12`。两者的真实内容永远不能通过 `READ` 或 `FAST_READ` 读出，读取对应页面时标签返回 `00h` 字节；因此读到 `00 00` 不能证明实际 `PACK` 就是 `0000h`。仅写入 `PWD` 和 `PACK` 也不会自动启用保护，必须继续配置 `AUTH0`。
 
 ### `AUTHLIM`：限制错误认证次数
 
