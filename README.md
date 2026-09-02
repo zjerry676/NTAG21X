@@ -92,6 +92,8 @@ NTAG21x 的状态机包括 `IDLE`、`READY1`、`READY2`、`ACTIVE`、`AUTHENTICA
 
 `READ` 的返回长度固定为 16 字节，但请求参数是页地址；不能把返回长度误认为地址单位。`FAST_READ` 不应越过有效地址，越界和受保护访问都要检查 NAK。
 
+注：对于命令`COMPATIBILITY_WRITE`，虽然其写入时Data为16字节，但只会填充前四字节的数据，后12字节置零，此命令是为了兼容MIFARE Classic PCD时使用，MIFARE Classic PCD固定写16字节。
+
 ## 8.6 NFC 计数器
 
 NTAG21x 的 NFC counter 是一个 24 位单向计数器。它可以被读取，也可以由芯片自动递增，但不能通过命令直接写入、减小或清零。达到 `FFFFFFh` 后，计数值不再变化。
